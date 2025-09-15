@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+CT CGA bill status scraper (MVP)
+
+Usage:
+    python scrape_ct_bill.py HB 6436 2025
+Outputs JSON to stdout with:
+    bill_id, session, bill_type, number, title, sponsors[], actions[], texts[]
+"""
+
+import sys, time, json, re
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://www.cga.ct.gov/asp/cgabillstatus/cgabillstatus.asp"
+
+HEADERS = {
+    "User-Agent": "CTLegis-MVP/0.1 (+https://focustower.com; contact: data@focustower.com)"
+}
+
+# --------- Models ---------
+@dataclass
+class Sponsor:
+    name: str
+    role: Optional[str] = None
+
+@dataclass
+class Action:
+    action_date: Optional[str]
+    actor: Optional[str]
+    action_text: str
+    stage: Optional[str] = None
+
+@dataclass
+class TextVersion:
+    label: str       # e.g., "Bill Text", "File Copy", "Public Act"
+    url: str
+    mime: Optional[str] = None
+
+@dataclass
+class Bill:
+    bill_id: str
+    session: str
+    bill_type: str
+    number: str
+    title: Optional[str]
+    sponsors: List[Sponsor]
+    actions: List[Action]
+    texts: List[TextVersion]
+    source_url: str
+
+# --------- Helpers ---------
+def build_bill_url(bill_type: str, number: str, session_year: str) -> str:
+    # CT pads numbers to 5 digits in many URLs; the search page accepts unpadded too.
+    num = number.zfill(5)
+    return f"{BASE}?selBillType={bill_type.upper()}&bill_num={num}&which_year={session_year}"
+
+def get(url: str, max_tries: int = 4, sleep: float = 1.2) -> requests.Response:
+    last_err = None
+    for i in range(max_tries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"Server {r.status_code}")
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep * (i + 1))
+    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
+
+def norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+# --------- Parsers ---------
+def parse_title(soup: BeautifulSoup) -> Optional[str]:
+    # Commonly in <h2> or nearby bold elements
+    h2 = soup.select_one("h2")
+    if h2 and norm_ws(h2.text):
+        return norm_ws(h2.text)
+    # fallback: bold header near "Bill No."
+    for tag in soup.find_all(["b", "strong", "h3"]):
+        txt = norm_ws(tag.get_text(" "))
+        if "Bill No." in txt or "Bill Title" in txt or "General Assembly" in txt:
+            # Look for sibling with title
+            sib = tag.find_next()
+            if sib and norm_ws(sib.text):
+                t = norm_ws(sib.text)
+                if len(t) > 8:
+                    return t
+    # generic title fallback
+    title_meta = soup.find("title")
+    return norm_ws(title_meta.text) if title_meta else None
+
+def parse_sponsors(soup: BeautifulSoup) -> List[Sponsor]:
+    sponsors: List[Sponsor] = []
+    # Look for a section with "Sponsors" label
+    labels = soup(text=re.compile(r"^Sponsor(s)?\b", re.I))
+    if labels:
+        for lbl in labels:
+            # Often sponsors are in the next <td> or next sibling
+            cell = None
+            if hasattr(lbl, "parent"):
+                # try parent td then next td
+                td = lbl.find_parent("td")
+                if td:
+                    # Sometimes the label + data are in the same td
+                    rest = norm_ws(td.get_text(" "))
+                    if ":" in rest:
+                        # e.g., "Sponsors: Smith; Doe; ..."
+                        after = rest.split(":", 1)[1]
+                        sponsors = [Sponsor(name=norm_ws(x)) for x in re.split(r"[;,]", after) if norm_ws(x)]
+                        if sponsors:
+                            return sponsors
+                    # else try next td
+                    nxt = td.find_next_sibling("td")
+                    if nxt:
+                        names = [norm_ws(x) for x in re.split(r"[;,]", nxt.get_text(" ")) if norm_ws(x)]
+                        sponsors = [Sponsor(name=n) for n in names]
+                        if sponsors:
+                            return sponsors
+            # Fallback: scan links containing ?member_ or /legislators/
+    # Broad fallback: find all anchors that look like member links
+    for a in soup.find_all("a", href=True):
+        if re.search(r"(MemberID|legislators|Rep|Sen)", a["href"], re.I):
+            nm = norm_ws(a.get_text(" "))
+            if nm and nm not in [s.name for s in sponsors]:
+                sponsors.append(Sponsor(name=nm))
+    return sponsors
+
+def parse_actions(soup: BeautifulSoup) -> List[Action]:
+    actions: List[Action] = []
+    # Actions usually appear in a table with date, chamber/actor, and description
+    candidate_tables = []
+    for table in soup.find_all("table"):
+        hdr = norm_ws(table.get_text(" "))
+        if re.search(r"Action(s)?\b", hdr, re.I):
+            candidate_tables.append(table)
+    # Pick the most "action-like" (many rows)
+    table = max(candidate_tables, key=lambda t: len(t.find_all("tr")), default=None)
+    if not table:
+        # fallback: any table with date-like cells
+        for t in soup.find_all("table"):
+            txt = t.get_text(" ")
+            if re.search(r"\b(20\d{2}|19\d{2})\b", txt) and len(t.find_all("tr")) > 3:
+                table = t
+                break
+    if not table:
+        return actions
+
+    for tr in table.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        if len(tds) < 2:
+            continue
+        cols = [norm_ws(td.get_text(" ")) for td in tds]
+        # Heuristics: date in col0, actor in col1, text in last
+        date = actor = None
+        text = None
+        if len(cols) >= 3:
+            date = cols[0] if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", cols[0]) else None
+            actor = cols[1] if cols[1] and len(cols[1]) <= 24 else None
+            text = cols[-1]
+        else:
+            # 2-col fallback: date + text
+            if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", cols[0]):
+                date, text = cols[0], cols[1]
+            else:
+                text = " — ".join(cols)
+        if text:
+            actions.append(Action(action_date=date, actor=actor, action_text=text))
+    return actions
+
+def parse_text_versions(soup: BeautifulSoup) -> List[TextVersion]:
+    texts: List[TextVersion] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        label = norm_ws(a.get_text(" "))
+        if not label:
+            continue
+        if any(k in href.lower() for k in [".pdf", ".doc", ".rtf"]) or \
+           "billtext" in href.lower() or "pub" in label.lower() or "file copy" in label.lower():
+            url = href if href.startswith("http") else "https://www.cga.ct.gov/" + href.lstrip("/")
+            mime = None
+            if href.lower().endswith(".pdf"):
+                mime = "application/pdf"
+            elif href.lower().endswith(".doc") or href.lower().endswith(".docx"):
+                mime = "application/msword"
+            elif href.lower().endswith(".rtf"):
+                mime = "application/rtf"
+            texts.append(TextVersion(label=label, url=url, mime=mime))
+    # de-dup by URL
+    seen = set()
+    uniq = []
+    for t in texts:
+        if t.url not in seen:
+            uniq.append(t)
+            seen.add(t.url)
+    return uniq
+
+# --------- Main ---------
+def scrape_bill(bill_type: str, number: str, session_year: str) -> Bill:
+    url = build_bill_url(bill_type, number, session_year)
+    r = get(url)
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    title = parse_title(soup)
+    sponsors = parse_sponsors(soup)
+    actions = parse_actions(soup)
+    texts = parse_text_versions(soup)
+
+    bill_id = f"CT-{session_year}-{bill_type.upper()}-{number.zfill(5)}"
+    return Bill(
+        bill_id=bill_id,
+        session=session_year,
+        bill_type=bill_type.upper(),
+        number=number.zfill(5),
+        title=title,
+        sponsors=sponsors,
+        actions=actions,
+        texts=texts,
+        source_url=url,
+    )
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print("Usage: python scrape_ct_bill.py <HB|SB|HBJ|SBJ|etc.> <number> <session_year>", file=sys.stderr)
+        sys.exit(2)
+    bill_type, number, session_year = sys.argv[1], sys.argv[2], sys.argv[3]
+    bill = scrape_bill(bill_type, number, session_year)
+    print(json.dumps(asdict(bill), indent=2, ensure_ascii=False))
